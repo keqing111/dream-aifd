@@ -1,0 +1,568 @@
+"""
+Unit tests for the config module in the Speculators library.
+"""
+
+import copy
+import json
+import tempfile
+from pathlib import Path
+from typing import Literal
+from unittest.mock import MagicMock, patch
+
+import pytest
+from pydantic import ValidationError
+from transformers import LlamaConfig, PretrainedConfig
+
+from speculators import (
+    SpeculatorModelConfig,
+    SpeculatorsConfig,
+    TokenProposalConfig,
+    VerifierConfig,
+    reload_schemas,
+)
+from speculators.models.eagle3 import Eagle3SpeculatorConfig
+from speculators.proposals.greedy import GreedyTokenProposalConfig
+
+# ===== TokenProposalConfig Tests =====
+
+
+@TokenProposalConfig.register("test_proposal")
+class TokenProposalConfigTest(TokenProposalConfig):
+    proposal_type: Literal["test_proposal"] = "test_proposal"
+    test_field: int = 123
+
+
+# Ensure the schemas are reloaded to include the test proposal type
+reload_schemas()
+
+
+@pytest.mark.smoke
+def test_token_proposal_config_initialization():
+    config: TokenProposalConfigTest = TokenProposalConfig(  # type: ignore[assignment]
+        proposal_type="test_proposal"
+    )
+    assert config.proposal_type == "test_proposal"
+    assert config.test_field == 123
+
+
+@pytest.mark.smoke
+def test_token_proposal_config_subclass_initialization():
+    config = TokenProposalConfigTest()
+    assert config.proposal_type == "test_proposal"
+    assert config.test_field == 123
+
+
+@pytest.mark.smoke
+def test_token_proposal_config_invalid_initialization():
+    with pytest.raises(ValidationError) as exc_info:
+        TokenProposalConfig()  # type: ignore[call-arg]
+
+    assert "proposal_type" in str(exc_info.value)
+
+
+@pytest.mark.smoke
+def test_token_proposal_config_auto_registry():
+    classes = TokenProposalConfig.registered_classes()
+    class_names = [cls.__name__ for cls in classes]
+    assert len(class_names) > 0
+    assert "GreedyTokenProposalConfig" in class_names
+
+
+@pytest.mark.sanity
+def test_token_proposal_config_marshalling():
+    original_config = TokenProposalConfigTest()
+
+    config_dict = original_config.model_dump()
+    assert isinstance(config_dict, dict)
+    assert config_dict["proposal_type"] == "test_proposal"
+    assert config_dict["test_field"] == 123
+
+    recreated_config: TokenProposalConfigTest = (
+        TokenProposalConfig.model_validate(config_dict)  # type: ignore[assignment]
+    )
+    assert recreated_config.proposal_type == original_config.proposal_type
+    assert recreated_config.test_field == original_config.test_field
+
+
+# ===== VerifierConfig Tests =====
+
+
+@pytest.fixture
+def mock_pretrained_config():
+    config = MagicMock(spec=PretrainedConfig)
+    config.name_or_path = "test/verifier"
+    config.to_dict.return_value = {
+        "architectures": ["TestModel"],
+        "hidden_size": 768,
+        "intermediate_size": 3072,
+        "vocab_size": 50000,
+        "max_position_embeddings": 512,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+    }
+    return config
+
+
+@pytest.mark.smoke
+def test_verifier_config_initialization():
+    config = VerifierConfig(
+        name_or_path="test/verifier",
+        architectures=["TestModel"],
+    )
+
+    assert config.name_or_path == "test/verifier"
+    assert config.architectures == ["TestModel"]
+
+
+@pytest.mark.smoke
+def test_verifier_config_from_verifier_config(mock_pretrained_config):
+    config = VerifierConfig.from_config(mock_pretrained_config)
+
+    assert config.name_or_path == "test/verifier"
+    assert config.architectures == ["TestModel"]
+
+
+@pytest.mark.smoke
+def test_verifier_config_from_pretrained_reads_architectures(tmp_path):
+    """from_pretrained reads architectures from the verifier's own config.json
+    (not from a draft decoder config, which has none)."""
+    LlamaConfig(
+        hidden_size=32,
+        num_hidden_layers=2,
+        architectures=["LlamaForCausalLM"],
+    ).save_pretrained(tmp_path)
+
+    config = VerifierConfig.from_pretrained(str(tmp_path))
+
+    assert config.name_or_path == str(tmp_path)
+    assert config.architectures == ["LlamaForCausalLM"]
+
+
+@pytest.mark.smoke
+def test_verifier_config_from_pretrained_defaults_to_empty(tmp_path):
+    """A config without an ``architectures`` entry yields an empty list."""
+    LlamaConfig(hidden_size=32, num_hidden_layers=2).save_pretrained(tmp_path)
+
+    config = VerifierConfig.from_pretrained(str(tmp_path))
+
+    assert config.architectures == []
+
+
+@pytest.mark.smoke
+def test_verifier_config_invalid_initialization():
+    with pytest.raises(ValidationError) as exc_info:
+        VerifierConfig()  # type: ignore[call-arg]
+
+    error_str = str(exc_info.value)
+    assert "name_or_path" in error_str
+    assert "architectures" in error_str
+
+
+@pytest.mark.sanity
+def test_verifier_config_marshalling():
+    original_config = VerifierConfig(
+        name_or_path="test/verifier",
+        architectures=["TestModel"],
+    )
+
+    config_dict = original_config.model_dump()
+    assert isinstance(config_dict, dict)
+    assert config_dict["name_or_path"] == "test/verifier"
+    assert config_dict["architectures"] == ["TestModel"]
+
+    recreated_config = VerifierConfig.model_validate(config_dict)
+    assert recreated_config.name_or_path == original_config.name_or_path
+    assert recreated_config.architectures == original_config.architectures
+
+
+# ===== SpeculatorsConfig Tests =====
+
+
+@pytest.fixture
+def sample_token_proposal_config():
+    return TokenProposalConfigTest()
+
+
+@pytest.fixture
+def sample_verifier_config():
+    return VerifierConfig(
+        name_or_path="test/verifier",
+        architectures=["TestModel"],
+    )
+
+
+@pytest.mark.smoke
+def test_speculators_config_initialization(
+    sample_token_proposal_config, sample_verifier_config
+):
+    config = SpeculatorsConfig(
+        algorithm="test_algorithm",
+        proposal_methods=[sample_token_proposal_config],
+        default_proposal_method="test_proposal",
+        verifier=sample_verifier_config,
+    )
+
+    assert config.algorithm == "test_algorithm"
+    assert len(config.proposal_methods) == 1
+    assert config.proposal_methods[0].proposal_type == "test_proposal"
+    assert config.default_proposal_method == "test_proposal"
+    assert config.verifier.name_or_path == "test/verifier"
+
+
+@pytest.mark.smoke
+def test_speculators_config_invalid_initialization(
+    sample_token_proposal_config, sample_verifier_config
+):
+    with pytest.raises(ValidationError) as exc_info:
+        SpeculatorsConfig()  # type: ignore[call-arg]
+
+    error_str = str(exc_info.value)
+    assert "algorithm" in error_str
+    assert "proposal_methods" in error_str
+    assert "default_proposal_method" in error_str
+    assert "verifier" in error_str
+
+
+@pytest.mark.sanity
+def test_speculators_config_marshalling(
+    sample_token_proposal_config, sample_verifier_config
+):
+    original_config = SpeculatorsConfig(
+        algorithm="test_algorithm",
+        proposal_methods=[sample_token_proposal_config],
+        default_proposal_method="test_proposal",
+        verifier=sample_verifier_config,
+    )
+
+    config_dict = original_config.model_dump()
+    assert isinstance(config_dict, dict)
+    assert config_dict["algorithm"] == "test_algorithm"
+    assert len(config_dict["proposal_methods"]) == 1
+    assert config_dict["proposal_methods"][0]["proposal_type"] == "test_proposal"
+    assert config_dict["default_proposal_method"] == "test_proposal"
+
+    recreated_config = SpeculatorsConfig.model_validate(config_dict)
+    assert recreated_config.algorithm == original_config.algorithm
+    assert (
+        recreated_config.proposal_methods[0].proposal_type
+        == original_config.proposal_methods[0].proposal_type
+    )
+    assert (
+        recreated_config.default_proposal_method
+        == original_config.default_proposal_method
+    )
+    assert (
+        recreated_config.verifier.name_or_path == original_config.verifier.name_or_path
+    )
+
+
+# ===== SpeculatorModelConfig Tests =====
+
+
+@SpeculatorModelConfig.register("test_model")
+class SpeculatorModelConfigTest(SpeculatorModelConfig):
+    speculators_model_type: Literal["test_model"] = "test_model"
+    test_field: int = 456
+
+
+# Ensure the schemas are reloaded to include the test proposal type
+reload_schemas()
+
+
+@pytest.fixture
+def sample_speculators_config(sample_token_proposal_config, sample_verifier_config):
+    return SpeculatorsConfig(
+        algorithm="test_algorithm",
+        proposal_methods=[sample_token_proposal_config],
+        default_proposal_method="test_proposal",
+        verifier=sample_verifier_config,
+    )
+
+
+@pytest.mark.smoke
+def test_speculator_model_config_initialization(sample_speculators_config):
+    config = SpeculatorModelConfig(
+        speculators_model_type="test_model",
+        speculators_config=sample_speculators_config,
+    )
+
+    assert config.speculators_model_type == "test_model"
+    assert config.speculators_config.algorithm == "test_algorithm"
+    assert config.speculators_version is not None
+
+    # Check that PretrainedConfig attributes are accessible
+    assert hasattr(config, "to_dict")
+    assert hasattr(config, "to_diff_dict")
+    assert hasattr(config, "to_json_string")
+    assert hasattr(config, "to_json_file")
+    assert hasattr(config, "save_pretrained")
+
+
+@pytest.mark.smoke
+def test_speculator_model_config_auto_registry():
+    classes = SpeculatorModelConfig.registered_classes()
+    class_names = [cls.__name__ for cls in classes]
+    assert len(class_names) > 0
+    assert "Eagle3SpeculatorConfig" in class_names
+
+
+@pytest.mark.smoke
+def test_speculator_model_config_marshalling(sample_speculators_config):
+    original_config = SpeculatorModelConfigTest(
+        speculators_model_type="test_model",
+        speculators_config=sample_speculators_config,
+        test_field=678,
+    )
+
+    config_dict = original_config.model_dump()
+    assert isinstance(config_dict, dict)
+    assert config_dict["speculators_model_type"] == "test_model"
+    assert config_dict["speculators_config"]["algorithm"] == "test_algorithm"
+    assert config_dict["test_field"] == 678
+
+    recreated_config = SpeculatorModelConfig.model_validate(config_dict)
+    assert (
+        recreated_config.speculators_model_type
+        == original_config.speculators_model_type
+    )
+    assert (
+        recreated_config.speculators_config.algorithm
+        == original_config.speculators_config.algorithm
+    )
+    assert recreated_config.test_field == original_config.test_field
+
+
+@pytest.mark.smoke
+def test_speculator_model_config_dict_marshaling(sample_speculators_config):
+    config: SpeculatorModelConfigTest = SpeculatorModelConfigTest(
+        speculators_model_type="test_model",
+        speculators_config=sample_speculators_config,
+        test_field=678,
+    )
+
+    config_dict = config.to_dict()
+    assert isinstance(config_dict, dict)
+    assert config_dict["speculators_model_type"] == "test_model"
+    assert config_dict["speculators_config"]["algorithm"] == "test_algorithm"
+    assert config_dict["test_field"] == 678
+
+    config_diff_dict = config.to_diff_dict()
+    assert isinstance(config_diff_dict, dict)
+    assert config_diff_dict["speculators_model_type"] == "test_model"
+    assert config_diff_dict["speculators_config"]["algorithm"] == "test_algorithm"
+    assert config_diff_dict["test_field"] == 678
+
+    reload_config = SpeculatorModelConfig.from_dict(config_dict)
+    assert reload_config.speculators_model_type == "test_model"
+    assert reload_config.speculators_config.algorithm == "test_algorithm"
+    assert reload_config.test_field == 678
+
+    reload_diff_config = SpeculatorModelConfig.from_dict(config_diff_dict)
+    assert reload_diff_config.speculators_model_type == "test_model"
+    assert reload_diff_config.speculators_config.algorithm == "test_algorithm"
+    assert reload_diff_config.test_field == 678
+
+
+@pytest.mark.sanity
+def test_speculator_model_config_from_dict_invalid(sample_speculators_config):
+    with pytest.raises(ValueError) as exc_info:
+        SpeculatorModelConfig.from_dict({})
+
+    assert (
+        "The config dictionary must contain the 'speculators_model_type' field"
+        in str(exc_info.value)
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        SpeculatorModelConfig.from_dict(
+            {
+                "speculators_config": sample_speculators_config.model_dump(),
+                "test_field": 678,
+            }
+        )
+
+    assert (
+        "The config dictionary must contain the 'speculators_model_type' field "
+        in str(exc_info.value)
+    )
+
+
+@pytest.mark.smoke
+def test_speculator_model_config_from_pretrained_local_marshalling(
+    sample_speculators_config,
+):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir) / "config.json"
+        config: SpeculatorModelConfigTest = SpeculatorModelConfigTest(
+            speculators_model_type="test_model",
+            speculators_config=sample_speculators_config,
+            test_field=678,
+        )
+        config.save_pretrained(tmp_path)
+        assert tmp_path.exists()
+
+        reloaded_config = SpeculatorModelConfig.from_pretrained(tmp_path)
+        assert reloaded_config.speculators_model_type == "test_model"
+        assert reloaded_config.speculators_config.algorithm == "test_algorithm"
+        assert reloaded_config.test_field == 678
+
+
+@pytest.mark.smoke
+def test_speculator_model_config_from_pretrained_hf_hub(sample_speculators_config):
+    config_data = {
+        "speculators_model_type": "test_model",
+        "speculators_config": sample_speculators_config.model_dump(),
+        "test_field": 678,
+    }
+
+    with patch.object(SpeculatorModelConfig, "get_config_dict") as mock_get_config_dict:
+        mock_get_config_dict.return_value = (config_data, {})
+        config = SpeculatorModelConfig.from_pretrained("test/fake-model-hub-name")
+
+        mock_get_config_dict.assert_called_once_with(
+            "test/fake-model-hub-name",
+            cache_dir=None,
+            force_download=False,
+            local_files_only=False,
+            token=None,
+            revision="main",
+        )
+
+        # Verify the config was loaded correctly
+        assert config.speculators_model_type == "test_model"
+        assert config.speculators_config.algorithm == "test_algorithm"
+        assert config.test_field == 678
+
+
+@pytest.mark.smoke
+def test_speculator_model_config_from_pretrained_conversion(sample_speculators_config):
+    # conversion not implemented yet, ensure it raises NotImplementedError
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir) / "config.json"
+        config_data = {
+            "speculators_config": sample_speculators_config.model_dump(),
+            "test_field": 678,
+        }
+        with tmp_path.open("w") as f:
+            json.dump(config_data, f)
+
+        with pytest.raises(NotImplementedError) as exc_info:
+            SpeculatorModelConfig.from_pretrained(tmp_path, convert_to_speculator=True)
+
+    assert "Loading a non-speculator model config is not supported yet" in str(
+        exc_info.value
+    )
+
+
+# ===== Eagle3SpeculatorConfig Tests =====
+
+TINY_LLAMA_CONFIG = LlamaConfig(
+    vocab_size=64,
+    hidden_size=32,
+    intermediate_size=128,
+    num_hidden_layers=1,
+    num_attention_heads=4,
+    num_key_value_heads=4,
+    head_dim=8,
+    max_position_embeddings=32,
+    rms_norm_eps=1e-6,
+    tie_word_embeddings=False,
+)
+
+
+def _make_eagle3_speculators_config():
+    return SpeculatorsConfig(
+        algorithm="eagle3",
+        proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=1)],
+        default_proposal_method="greedy",
+        verifier=VerifierConfig(
+            name_or_path=None,
+            architectures=["LlamaForCausalLM"],
+        ),
+    )
+
+
+@pytest.mark.sanity
+def test_eagle3_config_norm_output_roundtrip():
+    original = Eagle3SpeculatorConfig(
+        transformer_layer_config=copy.deepcopy(TINY_LLAMA_CONFIG),
+        draft_vocab_size=32000,
+        norm_before_residual=False,
+        norm_output=True,
+        speculators_config=_make_eagle3_speculators_config(),
+    )
+
+    config_dict = original.model_dump()
+    assert config_dict["norm_output"] is True
+
+    recreated = Eagle3SpeculatorConfig.model_validate(config_dict)
+    assert recreated.norm_output is True
+
+
+@pytest.mark.sanity
+def test_eagle3_config_norm_output_dict_roundtrip():
+    original = Eagle3SpeculatorConfig(
+        transformer_layer_config=copy.deepcopy(TINY_LLAMA_CONFIG),
+        draft_vocab_size=32000,
+        norm_output=True,
+        speculators_config=_make_eagle3_speculators_config(),
+    )
+
+    config_dict = original.to_dict()
+    assert config_dict["norm_output"] is True
+
+    reloaded = SpeculatorModelConfig.from_dict(config_dict)
+    assert reloaded.norm_output is True
+
+
+@pytest.mark.sanity
+def test_eagle3_config_norm_output_pretrained_roundtrip():
+    original = Eagle3SpeculatorConfig(
+        transformer_layer_config=copy.deepcopy(TINY_LLAMA_CONFIG),
+        draft_vocab_size=32000,
+        norm_output=True,
+        speculators_config=_make_eagle3_speculators_config(),
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        original.save_pretrained(tmp_dir)
+        reloaded = SpeculatorModelConfig.from_pretrained(tmp_dir)
+
+    assert reloaded.norm_output is True
+
+
+@pytest.mark.sanity
+def test_eagle3_config_norm_output_defaults():
+    config = Eagle3SpeculatorConfig(
+        transformer_layer_config=copy.deepcopy(TINY_LLAMA_CONFIG),
+        speculators_config=_make_eagle3_speculators_config(),
+    )
+    assert config.norm_output is False
+    assert config.fc_norm is False
+
+
+@pytest.mark.sanity
+def test_eagle3_config_rejects_both_norm_before_fc_and_fc_norm():
+    with pytest.raises(ValidationError, match="mutually exclusive"):
+        Eagle3SpeculatorConfig(
+            transformer_layer_config=copy.deepcopy(TINY_LLAMA_CONFIG),
+            norm_before_fc=True,
+            fc_norm=True,
+            speculators_config=_make_eagle3_speculators_config(),
+        )
+
+
+@pytest.mark.sanity
+def test_eagle3_config_fc_norm_roundtrip():
+    original = Eagle3SpeculatorConfig(
+        transformer_layer_config=copy.deepcopy(TINY_LLAMA_CONFIG),
+        draft_vocab_size=32000,
+        fc_norm=True,
+        speculators_config=_make_eagle3_speculators_config(),
+    )
+
+    config_dict = original.to_dict()
+    assert config_dict["fc_norm"] is True
+
+    reloaded = SpeculatorModelConfig.from_dict(config_dict)
+    assert reloaded.fc_norm is True

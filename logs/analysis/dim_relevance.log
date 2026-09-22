@@ -1,0 +1,26 @@
+/usr/local/python3.12.13/lib/python3.12/site-packages/transformers/loss/loss_for_object_detection.py:27: UserWarning: A NumPy version >=1.22.4 and <2.3.0 is required for this version of SciPy (detected version 2.4.6)
+  from scipy.optimize import linear_sum_assignment
+加载 /home/y50063564/Qwen3-4B（eager）
+Loading weights:   0%|          | 0/398 [00:00<?, ?it/s]Loading weights: 100%|██████████| 398/398 [00:00<00:00, 7843.25it/s]
+/home/y50063564/aifd_probe_20260921/scripts/analyze_dim_relevance.py:117: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
+  g = torch.randn_like(logits)
+  L10 完成（剔除离群 3/810 token）
+  L20 完成（剔除离群 3/810 token）
+  L30 完成（剔除离群 3/810 token）
+  L35 完成（剔除离群 3/810 token）
+
+================================================================================================
+【任务相关度】‖∂logits/∂h[L][d]‖²  （扰动该维对最终输出影响多大）
+   层      CV      前5%维占比     前10%     前50%       逐维方差CV       ρ(相关度,方差)         相关度top5%维占方差
+  10   0.423       10.9%    17.8%    60.2%        1.942          0.1744                21.7%
+  20   0.328        9.3%    16.1%    58.9%        1.902         -0.4289                19.0%
+  30   1.252       13.0%    19.3%    58.0%        1.946          0.3740                18.4%
+  35   3.653       19.2%    25.2%    62.0%        3.803          0.1702                12.0%
+
+读法：
+  * 相关度若集中在少数维 → 前5%/前10% 应该远大于 5%/10%，CV 应该很大
+  * ρ(相关度,方差) 接近 0 → 方差完全不能指示哪些维重要（支持假设）
+  * 最后两列：相关度 top5% 的维占总方差的比例；无关时期望 ≈5%
+
+【对照】lm_head 权重逐维列范数: CV=0.113  前5%维占 6.9%
+  （若 lm_head 均匀读所有维，CV 会很小）

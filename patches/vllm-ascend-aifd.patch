@@ -1,0 +1,21 @@
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index f90286513..e7d277a14 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -3797,6 +3797,16 @@ class NPUModelRunner(GPUModelRunner):
+                     aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+                 self.model.set_aux_hidden_state_layers(aux_layers)
+ 
++                # AIFD（可选）：额外产出一个「按注意力熵选层」的 hidden-states 通道。
++                # 没配 aifd_config 时是纯粹的 no-op。这是 Ascend 上真正生效的路径
++                # （vllm_ascend 自己的 model runner 覆盖了上游 v1/v2 两套）。
++                from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (  # noqa: PLC0415
++                    maybe_enable_aifd,
++                )
++
++                if self.speculative_config is not None:
++                    maybe_enable_aifd(self.model, self.speculative_config)
++
+                 if pp_group.world_size > 1:
+                     inner_model = self.model
+                     if hasattr(inner_model, "get_language_model"):

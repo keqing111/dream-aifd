@@ -1,0 +1,705 @@
+diff --git a/scripts/launch_vllm.py b/scripts/launch_vllm.py
+index b9b4757..56457d5 100644
+--- a/scripts/launch_vllm.py
++++ b/scripts/launch_vllm.py
+@@ -76,6 +76,32 @@ def parse_args():
+             "Note: if set, you must also pass the same value into the training process"
+         ),
+     )
++    parser.add_argument(
++        "--aifd-candidate-layers",
++        type=int,
++        nargs="+",
++        default=None,
++        help=(
++            "(Optional) Enable AIFD: pick, per sample, the candidate layer with "
++            "the lowest attention-entropy score and append its hidden states as "
++            "one extra channel. Layer ids follow the eagle_aux convention "
++            "(id L = output of layer L-1, 0-based). Omit to disable. "
++            "The training side must expect num_aux + 1 channels."
++        ),
++    )
++    parser.add_argument(
++        "--aifd-granularity",
++        type=str,
++        choices=["sample", "token"],
++        default="sample",
++        help=(
++            "AIFD selection granularity. 'sample': every token in a request gets "
++            "the SAME layer (aggregate the per-token entropy over the request "
++            "before argmin). 'token': each token picks its own layer "
++            "(DREAM-S's original behaviour). Only meaningful with "
++            "--aifd-candidate-layers."
++        ),
++    )
+     parser.add_argument(
+         "--include-last-layer",
+         action=argparse.BooleanOptionalAction,
+@@ -122,12 +148,26 @@ def main():
+             num_hidden_layers,
+         ]
+ 
++    hf_config: dict = {"eagle_aux_hidden_state_layer_ids": target_layer_ids}
++    if args.aifd_candidate_layers:
++        # 额外产出一个「按注意力熵选层」的通道；层号用 eagle_aux 约定
++        # （id L = 第 L-1 层（0-based）的输出）。空表示关闭。
++        hf_config["aifd_config"] = {
++            "candidate_layers": list(args.aifd_candidate_layers),
++            "granularity": args.aifd_granularity,
++        }
++        warnings.warn(
++            "AIFD enabled: an extra hidden-states channel will be appended "
++            f"(candidate layers {args.aifd_candidate_layers}, "
++            f"granularity={args.aifd_granularity}). The training "
++            "side must expect num_aux + 1 channels.",
++            stacklevel=2,
++        )
++
+     speculative_config = {
+         "method": "extract_hidden_states",
+         "num_speculative_tokens": 1,
+-        "draft_model_config": {
+-            "hf_config": {"eagle_aux_hidden_state_layer_ids": target_layer_ids}
+-        },
++        "draft_model_config": {"hf_config": hf_config},
+     }
+     backend_cls = _backend_registry[args.hidden_states_backend]
+     kv_transfer_config = backend_cls.build_kv_transfer_config(args)
+diff --git a/scripts/train.py b/scripts/train.py
+index db0462e..3fd8583 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -630,6 +630,12 @@ def main(args: argparse.Namespace):  # noqa: C901
+     backend_cls = backend_registry[args.hidden_states_backend]
+     transfer = backend_cls.from_train_args(args, args.data_path)
+ 
++    if args.aifd_weight > 0.0 and args.speculator_type not in ("dflash", "dspark"):
++        parser.error(
++            f"--aifd-weight is only implemented for dflash/dspark, "
++            f"got --speculator-type {args.speculator_type}"
++        )
++
+     train_loader, val_loader = create_train_val_loaders(
+         data_path=args.data_path,
+         total_seq_len=args.total_seq_len,
+@@ -649,6 +655,9 @@ def main(args: argparse.Namespace):  # noqa: C901
+         prefetch_factor=args.prefetch_factor,
+         preprocess=preprocess,
+         train_data_ratio=args.train_data_ratio,
++        # AIFD 开启时 hidden states 末尾多一个「熵选层」通道（见 launch_vllm.py
++        # --aifd-candidate-layers）。数据加载器要据此把 verifier 末层往前挪一位。
++        aifd_channels=1 if args.aifd_weight > 0.0 else 0,
+     )
+ 
+     # Get trainer kwargs from model class
+@@ -658,6 +667,7 @@ def main(args: argparse.Namespace):  # noqa: C901
+         num_epochs=args.epochs,
+         save_path=args.save_path,
+         lr=args.lr,
++        grad_accum_steps=args.grad_accum_steps,
+         resume_from_checkpoint=not args.no_resume_from_checkpoint,
+         train_call_kwargs=train_call_kwargs,
+         val_call_kwargs=val_call_kwargs,
+@@ -1008,6 +1018,51 @@ def parse_args():
+             'combination, e.g. \'{"ce": 0.1, "tv": 0.9}\'.'
+         ),
+     )
++    parser.add_argument(
++        "--aifd-weight",
++        type=float,
++        default=0.0,
++        help=(
++            "AIFD (attention-entropy-guided intermediate feature distillation) "
++            "loss weight. 0 disables it. Requires the hidden states to have been "
++            "generated with `launch_vllm.py --aifd-candidate-layers ...`, which "
++            "appends one extra channel holding the entropy-selected layer's "
++            "hidden states. Independent of --loss-fn."
++        ),
++    )
++    parser.add_argument(
++        "--aifd-norm",
++        action=argparse.BooleanOptionalAction,
++        default=False,
++        help=(
++            "RMSNorm both sides before the AIFD loss. Off by default: the "
++            "candidate layers span only ~4.8x in norm, and the draft side is "
++            "already RMSNorm'd (self.norm) so both sides sit at comparable "
++            "per-element scale (~0.8 vs ~1.0)."
++        ),
++    )
++    parser.add_argument(
++        "--aifd-draft-layer",
++        type=int,
++        default=-1,
++        help=(
++            "Which draft hidden state the AIFD loss supervises, 1-based. "
++            "-1 (default) = the final normed hidden state (lm_head input). "
++            "2 = the 2nd decoder layer's raw output. Intermediate layers are "
++            "NOT normed, so check the train/aifd_loss magnitude."
++        ),
++    )
++    parser.add_argument(
++        "--grad-accum-steps",
++        type=int,
++        default=1,
++        help=(
++            "Gradient accumulation: optimizer.step() once every N micro-batches. "
++            "Gradients accumulate as the window MEAN (loss is divided by N). "
++            "The epoch's final batch always steps, so a trailing partial window "
++            "is flushed. The LR scheduler still ticks once per batch."
++        ),
++    )
+     parser.add_argument(
+         "--step-weight-beta",
+         type=float,
+diff --git a/src/speculators/models/dflash/config.py b/src/speculators/models/dflash/config.py
+index 8ad3976..bf491ea 100644
+--- a/src/speculators/models/dflash/config.py
++++ b/src/speculators/models/dflash/config.py
+@@ -81,6 +81,41 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
+         ),
+     )
+ 
++    aifd_weight: float = Field(
++        default=0.0,
++        description=(
++            "Weight of the AIFD hidden-state distillation loss. 0 disables it. "
++            "Requires the hidden-states files to carry the extra "
++            "entropy-selected channel produced by "
++            "`launch_vllm.py --aifd-candidate-layers`."
++        ),
++    )
++
++    aifd_norm: bool = Field(
++        default=False,
++        description=(
++            "RMSNorm both sides before the AIFD loss. Off by default: the "
++            "candidate layers span only ~4.8x in norm (within one order of "
++            "magnitude), and the BOS token's ~400x outlier never reaches the "
++            "loss because `select_anchors` only picks loss_mask positions "
++            "(verified: 0 hits on position 0 across 14624 anchor-block "
++            "positions). Turn on only if a future criterion widens the "
++            "candidate range or the selection starts varying per sample."
++        ),
++    )
++
++    aifd_draft_layer: int = Field(
++        default=-1,
++        description=(
++            "Which draft hidden state the AIFD loss supervises, 1-based. "
++            "-1 (default) = the final normed hidden state (lm_head input). "
++            "2 = the 2nd decoder layer's raw output, etc. Intermediate layers "
++            "are NOT normed, so their per-element scale differs from the "
++            "target's; check `train/aifd_loss` magnitude and consider "
++            "aifd_norm if it looks off."
++        ),
++    )
++
+     @field_serializer("transformer_layer_config")
+     def serialize_transformer_config(self, value: PretrainedConfig) -> dict:
+         """Serialize transformer config to dict."""
+diff --git a/src/speculators/models/dflash/core.py b/src/speculators/models/dflash/core.py
+index 0bad541..80e6c9e 100644
+--- a/src/speculators/models/dflash/core.py
++++ b/src/speculators/models/dflash/core.py
+@@ -14,7 +14,7 @@ from speculators.model import DraftVocabMixin, SpeculatorModel
+ from speculators.models.attention import create_float_mask
+ from speculators.models.dflash import DFlashSpeculatorConfig
+ from speculators.models.dflash.attention import create_anchor_block_mask_mod
+-from speculators.models.dflash.metrics import compute_metrics
++from speculators.models.dflash.metrics import compute_aifd_loss, compute_metrics
+ from speculators.models.dflash.model_definitions import Qwen3DFlashDecoderLayer
+ from speculators.models.dflash.utils import (
+     get_base_indices_for_anchored_blocks,
+@@ -212,6 +212,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+             "mask_token_id": kwargs.get("mask_token_id"),
+             "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
+             "sample_from_anchor": sample_from_anchor,
++            "aifd_weight": kwargs.get("aifd_weight", 0.0),
++            "aifd_norm": kwargs.get("aifd_norm", False),
++            "aifd_draft_layer": kwargs.get("aifd_draft_layer", -1),
+             "speculators_config": SpeculatorsConfig(
+                 algorithm=algorithm,
+                 proposal_methods=[
+@@ -247,6 +250,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+             "max_anchors": max_anchors,
+             "per_position_loss_weight": per_position_loss_weight,
+             "dpace_alpha": dpace_alpha,
++            # AIFD 中间层特征蒸馏（默认 0 = 关闭）
++            "aifd_weight": kwargs.get("aifd_weight", 0.0),
++            "aifd_norm": kwargs.get("aifd_norm", False),
++            "aifd_draft_layer": kwargs.get("aifd_draft_layer", -1),
+         }
+         return dict(shared), dict(shared)
+ 
+@@ -388,6 +395,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+             targets = verifier_logits[:, anchored_block_indices]
+             # shape: [1, num_anchors*block_size, draft_vocab_size]
+ 
++        aifd_pred: torch.Tensor | None = None
+         for layer_idx, layer in enumerate(self.layers):
+             noise_embedding = layer(
+                 hidden_states=noise_embedding,
+@@ -400,6 +408,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+                 position_embeddings=position_embeddings,
+                 **kwargs,
+             )
++            # AIFD 的监督点若配成中间层，就在这里截一张。1-based：
++            # `aifd_draft_layer=2` 取的是 5 层里 index 1 的输出；-1 = 不截，用最后那层。
++            if self.config.aifd_draft_layer == layer_idx + 1:
++                aifd_pred = noise_embedding
+ 
+         hidden = self.norm(noise_embedding)
+         logits = self.lm_head(hidden)
+@@ -419,7 +431,16 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+         if not self.config.sample_from_anchor:
+             aligned_loss_mask[:, :: self.block_size] = 0
+ 
+-        return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
++        # aifd_pred 是 AIFD 专用的监督点。**不能**用它替换 `hidden` ——
++        # DSpark 的 confidence head 要吃 `hidden`。没有配中间层时为 None。
++        return (
++            hidden,
++            logits,
++            targets,
++            aligned_loss_mask,
++            anchored_block_indices,
++            aifd_pred,
++        )
+ 
+     @conditional_torch_compile
+     def forward(
+@@ -435,17 +456,31 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+         max_anchors: int = 3072,
+         per_position_loss_weight: str = "fixed-exp-decay",
+         dpace_alpha: float = 0.5,
++        # AIFD：必须在这里显式接住，否则会经 **kwargs 透传给 decoder layer
++        aifd_hidden_states: torch.Tensor | None = None,
++        aifd_weight: float = 0.0,
++        aifd_norm: bool = False,
++        aifd_draft_layer: int = -1,  # noqa: ARG002  —— 已在 __init__ 时进 config
+         **kwargs,
+     ):
+-        _, logits, targets, aligned_loss_mask, _ = self._backbone_forward(
+-            hidden_states,
+-            input_ids,
+-            loss_mask,
+-            verifier_last_hidden_states,
+-            document_ids,
+-            position_ids,
+-            max_anchors=max_anchors,
+-            **kwargs,
++        (
++            hidden,
++            logits,
++            targets,
++            aligned_loss_mask,
++            anchored_block_indices,
++            aifd_pred,
++        ) = (
++            self._backbone_forward(
++                hidden_states,
++                input_ids,
++                loss_mask,
++                verifier_last_hidden_states,
++                document_ids,
++                position_ids,
++                max_anchors=max_anchors,
++                **kwargs,
++            )
+         )
+         loss, metrics = compute_metrics(
+             logits,
+@@ -458,4 +493,19 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+             dpace_alpha=dpace_alpha,
+             sample_from_anchor=self.config.sample_from_anchor,
+         )
++
++        # AIFD 中间层特征蒸馏：draft 的最终隐状态 → 熵选层的 target 隐状态。
++        # 和 `aifd_weight` 一起由 `get_trainer_kwargs` 经 train_call_kwargs 传进来；
++        # 数据里没有那一通道（= 没开 AIFD 的数据）时静默跳过。
++        if aifd_weight > 0.0 and aifd_hidden_states is not None:
++            aifd_loss, aifd_metrics = compute_aifd_loss(
++                aifd_pred if aifd_pred is not None else hidden,
++                aifd_hidden_states,
++                aligned_loss_mask,
++                anchored_block_indices,
++                norm=aifd_norm,
++            )
++            loss = loss + aifd_weight * aifd_loss
++            metrics.update(aifd_metrics)
++
+         return None, loss, metrics
+diff --git a/src/speculators/models/dflash/metrics.py b/src/speculators/models/dflash/metrics.py
+index 827db77..d8e820a 100644
+--- a/src/speculators/models/dflash/metrics.py
++++ b/src/speculators/models/dflash/metrics.py
+@@ -106,3 +106,50 @@ def compute_metrics(
+     metrics["eal_sum"] = eal
+     metrics["eal_total"] = ones.clone()
+     return loss, metrics
++
++
++def _rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
++    """不带可学参数的逐 token RMSNorm。
++
++    AIFD 的监督目标在不同样本上可能来自不同的层，层间尺度差实测 4.8x
++    （候选窗口内），而且层 6 以上恒有一个 BOS token 的 norm 是中位数的 400 倍。
++    两边各归一化一次，这两件事一起消掉。speculators 现有管线本来也在对隐状态
++    做 RMSNorm（`verifier_norm` / `hidden_norm`），所以这不是新引入的处理。
++    """
++    return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
++
++
++def compute_aifd_loss(
++    draft_hidden: torch.Tensor,  # [1, T, hidden_size]，norm 之后、lm_head 之前
++    aifd_hidden_states: torch.Tensor,  # [1, T, hidden_size]，AIFD 选层的目标
++    aligned_loss_mask: torch.Tensor,  # [1, num_anchors*block_size]
++    anchored_block_indices: torch.Tensor,  # [num_anchors*block_size]
++    norm: bool = False,
++) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
++    """AIFD 中间层特征蒸馏：draft 的最终隐状态 → 熵选层的 target 隐状态。
++
++    照搬 DREAM-S 的 `compute_mid_loss`（`train/main_deepspeed.py:244-247`）：
++    `nn.SmoothL1Loss(reduction="none")` 的 masked mean。
++
++    metric 走 `_sum`/`_total` 命名，让 `normalize_counted_metrics` 折算成
++    `aifd_loss`（= 每个有效位置的**平均** loss）。
++    """
++    pred = draft_hidden[:, anchored_block_indices]  # [1, A*bs, H]
++    tgt = aifd_hidden_states[:, anchored_block_indices]  # [1, A*bs, H]
++    if norm:
++        pred = _rms_norm(pred)
++        tgt = _rms_norm(tgt)
++
++    m = aligned_loss_mask.unsqueeze(-1).to(torch.float32)  # [1, A*bs, 1]
++    per_pos = torch.nn.functional.smooth_l1_loss(
++        pred.float(), tgt.float(), reduction="none"
++    ).mean(-1)  # [1, A*bs]
++
++    aifd_sum = (per_pos * m.squeeze(-1)).sum()
++    aifd_total = m.sum().clamp_min(1.0)
++    loss = aifd_sum / aifd_total
++    metrics = {
++        "aifd_loss_sum": aifd_sum.detach(),
++        "aifd_loss_total": aifd_total.detach(),
++    }
++    return loss, metrics
+diff --git a/src/speculators/models/dspark/core.py b/src/speculators/models/dspark/core.py
+index bfc4919..2d6ca67 100644
+--- a/src/speculators/models/dspark/core.py
++++ b/src/speculators/models/dspark/core.py
+@@ -5,6 +5,7 @@ from transformers import PretrainedConfig
+ 
+ from speculators.model import SpeculatorModel
+ from speculators.models.dflash.core import DFlashDraftModel
++from speculators.models.dflash.metrics import compute_aifd_loss
+ from speculators.models.dspark.config import DSparkSpeculatorConfig
+ from speculators.models.dspark.metrics import compute_metrics
+ from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
+@@ -105,6 +106,10 @@ class DSparkDraftModel(DFlashDraftModel):
+             "confidence_head_alpha": confidence_head_alpha,
+             "per_position_loss_weight": per_position_loss_weight,
+             "dpace_alpha": dpace_alpha,
++            # AIFD 中间层特征蒸馏（默认 0 = 关闭）
++            "aifd_weight": kwargs.get("aifd_weight", 0.0),
++            "aifd_norm": kwargs.get("aifd_norm", False),
++            "aifd_draft_layer": kwargs.get("aifd_draft_layer", -1),
+         }
+         return dict(shared), dict(shared)
+ 
+@@ -123,9 +128,21 @@ class DSparkDraftModel(DFlashDraftModel):
+         confidence_head_alpha: float = 1.0,
+         per_position_loss_weight: str = "fixed-exp-decay",
+         dpace_alpha: float = 0.5,
++        # AIFD：必须在这里显式接住，否则会经 **kwargs 透传给 decoder layer
++        aifd_hidden_states: torch.Tensor | None = None,
++        aifd_weight: float = 0.0,
++        aifd_norm: bool = False,
++        aifd_draft_layer: int = -1,  # noqa: ARG002  —— 已在 __init__ 时进 config
+         **kwargs,
+     ):
+-        hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
++        (
++            hidden,
++            logits,
++            targets,
++            aligned_loss_mask,
++            anchored_block_indices,
++            aifd_pred,
++        ) = (
+             self._backbone_forward(
+                 hidden_states,
+                 input_ids,
+@@ -197,4 +214,17 @@ class DSparkDraftModel(DFlashDraftModel):
+             dpace_alpha=dpace_alpha,
+             sample_from_anchor=self.config.sample_from_anchor,
+         )
++
++        # AIFD 中间层特征蒸馏：draft 的最终隐状态 → 熵选层的 target 隐状态。
++        if aifd_weight > 0.0 and aifd_hidden_states is not None:
++            aifd_loss, aifd_metrics = compute_aifd_loss(
++                aifd_pred if aifd_pred is not None else hidden,
++                aifd_hidden_states,
++                aligned_loss_mask,
++                anchored_block_indices,
++                norm=aifd_norm,
++            )
++            loss = loss + aifd_weight * aifd_loss
++            metrics.update(aifd_metrics)
++
+         return None, loss, metrics
+diff --git a/src/speculators/train/data.py b/src/speculators/train/data.py
+index 4ccd625..933b522 100644
+--- a/src/speculators/train/data.py
++++ b/src/speculators/train/data.py
+@@ -58,7 +58,10 @@ StandardizeFnSig = Callable[[dict[str, Any]], dict[str, Any]]
+ 
+ 
+ def create_empty_sample(
+-    hidden_size: int, num_target_layers: int = 3, dtype: torch.dtype = torch.bfloat16
++    hidden_size: int,
++    num_target_layers: int = 3,
++    dtype: torch.dtype = torch.bfloat16,
++    aifd: bool = False,
+ ):
+     # data structure: {
+     #     "hidden_states": [seq_len, num_target_layers * hidden_size],
+@@ -73,7 +76,7 @@ def create_empty_sample(
+     # we substitute an empty sample), the implicit float32 placeholders crashed
+     # bf16 EAGLE-3 layers (fc, verifier_lm_head) with a dtype mismatch.
+ 
+-    return {
++    sample = {
+         "hidden_states": torch.empty(0, num_target_layers * hidden_size, dtype=dtype),
+         "input_ids": torch.empty(0, dtype=torch.long),
+         "verifier_last_hidden_states": torch.empty(0, hidden_size, dtype=dtype),
+@@ -81,6 +84,11 @@ def create_empty_sample(
+         "lengths": torch.tensor([0], dtype=torch.long),
+         "position_ids": torch.arange(0, dtype=torch.long),
+     }
++    if aifd:
++        # AIFD 多出来的那一通道（熵选层的 target）。空样本也要有这个 key，
++        # 否则 collate 时 `batch[0]` 的 key 集合不一致会 KeyError。
++        sample["aifd_hidden_states"] = torch.empty(0, hidden_size, dtype=dtype)
++    return sample
+ 
+ 
+ def standardize_data_v1(data: dict[str, Any]) -> dict[str, Any]:
+@@ -214,7 +222,12 @@ class ArrowDataset(BaseDataset):
+         model: str | None = None,
+         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
+         max_retries: int = DEFAULT_MAX_RETRIES,
++        aifd_channels: int = 0,
+     ):
++        # AIFD 在 hidden-states 末尾额外追加的通道数（0 = 关闭）。
++        # 开启时最后一个通道是「熵选层」的 target，最后一个 aux 通道
++        # （= verifier 末层）要往前挪一位。
++        self.aifd_channels = aifd_channels
+         self.data = load_from_disk(datapath)
+         self.start_file_idx = 0
+         if split_ratio == 1.0:
+@@ -343,16 +356,23 @@ class ArrowDataset(BaseDataset):
+             )
+             return None
+ 
+-        return {
+-            "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
+-                1
+-            ),  # [seq_len, 3 * hidden_size]
++        # 通道排布： [aux_0, ..., aux_{n-1}, last_layer] ，
++        # 开了 AIFD 时末尾再追加一个「按注意力熵选层」的通道。
++        n_channels = loaded_hs["hidden_states"].shape[1]
++        out = {
++            "hidden_states": loaded_hs["hidden_states"][
++                :, : n_channels - 1 - self.aifd_channels
++            ].flatten(1),  # [seq_len, num_aux * hidden_size]
+             "input_ids": loaded_hs["token_ids"],  # [seq_len]
+             "verifier_last_hidden_states": loaded_hs["hidden_states"][
+-                :, -1
++                :, n_channels - 1 - self.aifd_channels
+             ],  # [seq_len, hidden_size]
+             "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
+         }
++        if self.aifd_channels:
++            out["aifd_hidden_states"] = loaded_hs["hidden_states"][:, -1]
++            # [seq_len, hidden_size]
++        return out
+ 
+ 
+ class SampleFileDataset(BaseDataset):
+@@ -458,6 +478,7 @@ def create_collate_fn(
+     num_target_layers: int = 3,
+     dtype: torch.dtype = torch.bfloat16,
+     preprocess: Callable[[BatchType], BatchType] | None = None,
++    aifd: bool = False,
+ ):
+     def collate_fn(batch: list[BatchType | None]) -> BatchType:
+         # Apply per-sample preprocessing and filter failed samples
+@@ -469,7 +490,9 @@ def create_collate_fn(
+             # Match the configured `dtype` so the placeholder doesn't crash
+             # downstream layers loaded at a different precision (e.g. bf16
+             # weights vs fp32 default placeholders).
+-            empty = create_empty_sample(hidden_size, num_target_layers, dtype=dtype)
++            empty = create_empty_sample(
++                hidden_size, num_target_layers, dtype=dtype, aifd=aifd
++            )
+             if preprocess:
+                 empty = preprocess(empty)
+             batch = [empty]
+diff --git a/src/speculators/train/dataloader.py b/src/speculators/train/dataloader.py
+index 754e932..cc9fddd 100644
+--- a/src/speculators/train/dataloader.py
++++ b/src/speculators/train/dataloader.py
+@@ -37,6 +37,7 @@ def _setup_dataloader(
+     num_target_layers: int = 3,
+     prefetch_factor: int | None = 4,
+     preprocess: Callable[[BatchType], BatchType] | None = None,
++    aifd_channels: int = 0,
+ ) -> DataLoader:
+     batch_sampler = MultipackDistributedBatchSamplerV2(
+         batch_max_length=total_seq_len,
+@@ -57,6 +58,7 @@ def _setup_dataloader(
+             num_target_layers=num_target_layers,
+             dtype=dataset.hidden_states_dtype,
+             preprocess=preprocess,
++            aifd=aifd_channels > 0,
+         ),
+         persistent_workers=use_workers,
+     )
+@@ -82,6 +84,7 @@ def create_train_val_loaders(
+     prefetch_factor: int,
+     preprocess: Callable[[BatchType], BatchType] | None,
+     train_data_ratio: float = 0.9,
++    aifd_channels: int = 0,
+ ) -> tuple[DataLoader, DataLoader]:
+     """Create training and validation DataLoaders.
+ 
+@@ -127,6 +130,7 @@ def create_train_val_loaders(
+             hidden_states_dtype=hidden_states_dtype,
+             request_timeout=request_timeout,
+             max_retries=max_retries,
++            aifd_channels=aifd_channels,
+         )
+         val_dataset = ArrowDataset(
+             datapath=data_path,
+@@ -140,6 +144,7 @@ def create_train_val_loaders(
+             hidden_states_dtype=hidden_states_dtype,
+             request_timeout=request_timeout,
+             max_retries=max_retries,
++            aifd_channels=aifd_channels,
+         )
+ 
+     train_loader = _setup_dataloader(
+@@ -147,6 +152,7 @@ def create_train_val_loaders(
+         total_seq_len,
+         hidden_size,
+         num_target_layers=num_target_layers,
++        aifd_channels=aifd_channels,
+         num_workers=num_workers,
+         prefetch_factor=prefetch_factor,
+         preprocess=preprocess,
+@@ -156,6 +162,7 @@ def create_train_val_loaders(
+         total_seq_len,
+         hidden_size,
+         num_target_layers=num_target_layers,
++        aifd_channels=aifd_channels,
+         num_workers=num_workers,
+         prefetch_factor=prefetch_factor,
+         preprocess=preprocess,
+diff --git a/src/speculators/train/trainer.py b/src/speculators/train/trainer.py
+index 51745db..4bd5f35 100644
+--- a/src/speculators/train/trainer.py
++++ b/src/speculators/train/trainer.py
+@@ -114,6 +114,29 @@ warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
+ MIN_STEP_PCT = 0.25
+ 
+ 
++def _accum_window_bounds(
++    local_step_rel: int, num_steps: int, accum_steps: int
++) -> tuple[bool, bool]:
++    """Locate a micro-batch inside its gradient-accumulation window.
++
++    `local_step_rel` is the 1-based position in the (unskipped) epoch.
++
++    Returns `(window_start, window_end)`: gradients are zeroed on
++    `window_start` and the optimizer steps on `window_end`. The epoch's final
++    micro-batch is always a `window_end`, so a trailing partial window is
++    flushed instead of dropped.
++
++    The start test subtracts 1 because `local_step_rel % accum_steps == 1`
++    never holds when `accum_steps == 1`, which would leave gradients unzeroed
++    forever on the default configuration.
++
++    (Ported from `sy5537/speculators-ty5537`.)
++    """
++    window_start = (local_step_rel - 1) % accum_steps == 0
++    window_end = local_step_rel % accum_steps == 0 or local_step_rel == num_steps
++    return window_start, window_end
++
++
+ class TrainerConfig(NamedTuple):
+     lr: float
+     num_epochs: int
+@@ -137,6 +160,9 @@ class TrainerConfig(NamedTuple):
+     save_best: bool = False
+     hidden_states_dtype: torch.dtype = torch.bfloat16
+     log_freq: int = 1
++    # 梯度累积：每 accum_steps 个 micro-batch 才做一次 optimizer.step()。
++    # 梯度按窗口**均值**累积（loss 先除以 accum_steps）。
++    grad_accum_steps: int = 1
+     fsdp_shard: bool = False
+ 
+ 
+@@ -443,6 +469,7 @@ class Trainer:
+ 
+         # Capture full-epoch step count before any resume fast-skip mutation.
+         num_steps = len(self.train_loader)
++        accum_steps = max(1, int(self.config.grad_accum_steps))
+ 
+         # Determine how many batches to skip for mid-epoch resume.
+         skip_steps = self._prepare_resume_skip(epoch)
+@@ -461,6 +488,13 @@ class Trainer:
+         for local_step_rel, batch in enumerate(train_loader, 1):
+             # local_step is 1-based index into the *full* epoch (not the slice).
+             local_step = local_step_rel + skip_steps
++            # 梯度累积：梯度在 accum_steps 个 micro-batch 上求和后才 step。
++            # global_step 仍按 batch 计，所以 metric 曲线的横轴还是每 batch 一个点。
++            # 一个 epoch 的最后一个 micro-batch 一定是 window_end，
++            # 所以结尾不满一个窗口的部分也会被 flush 掉、不会丢。
++            window_start, window_end = _accum_window_bounds(
++                local_step_rel, num_steps, accum_steps
++            )
+             timer.reset(self.global_step % self.config.log_freq == 0)
+ 
+             timer.mark_value("start", t_before_fetch)
+@@ -480,16 +514,25 @@ class Trainer:
+                 )
+ 
+             timer.mark("fwd")
+-            self._optimizers_zero_grad()
+-            loss.backward()
+-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
++            if window_start:
++                self._optimizers_zero_grad()
++            # 除以窗口大小：累积出来的是窗口**均值**而不是和。
++            (loss / accum_steps).backward()
++            if window_end:
++                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+ 
+             timer.mark("bwd")
+-            self._optimizers_step()
++            if window_end:
++                self._optimizers_step()
+ 
+             current_lrs = {
+                 type(opt).__name__: opt.param_groups[0]["lr"] for opt in self.optimizers
+             }
++            # scheduler 按 **batch** tick，不是按 optimizer update tick。
++            # `scheduler_total_steps` 是 `num_epochs * len(train_loader)`，也是按 batch 计的；
++            # 如果把这一步也放到 window_end 里，LR 会慢 accum_steps 倍、
++            # 整轮都走不出 warmup。LR 只在下次 step 时才生效，
++            # 所以在不更新的 micro-batch 上 tick 是无害的。
+             self._schedulers_step()
+             timer.mark("opt")
+             t_before_fetch = timer.now() or time.perf_counter()

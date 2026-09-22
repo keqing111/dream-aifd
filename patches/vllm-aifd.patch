@@ -1,0 +1,696 @@
+diff --git a/vllm/model_executor/models/aifd.py b/vllm/model_executor/models/aifd.py
+new file mode 100644
+index 0000000000..c3728200b5
+--- /dev/null
++++ b/vllm/model_executor/models/aifd.py
+@@ -0,0 +1,532 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""AIFD 选层：按注意力熵在候选层里挑一层，作为**额外的** hidden-states 通道送去训练。
++
++判据（per-sample，源自 DREAM-S 的 AIFD，粒度由 per-token 改为按样本）::
++
++    He[l, t] = mean_h ( lse[l,t,h] - scale * <q[t,h,:], O^K[t,h,:]> )    # 逐 token 的注意力熵
++    C_l      = mean_{t ∈ request} He[l, t]                               # 每个 request 一个标量
++    score_l  = C_l + |C_l - C_{l-1}|
++    best     = argmin_l score_l                                          # 在候选层内取
++
++``lse`` 与 ``O^K``（把 value 换成 key 的注意力输出）由**同一次**
++
++    npu_fused_infer_attention_score(q, k, v=key, ..., softmax_lse_flag=True) -> (O^K, lse)
++
++同时给出——``lse`` 与 V 无关，所以只多跑一次注意力，且**不落地 S×S**。
++推导与实测见 ``~/aifd_probe_20260921/RESULT_lse_entropy.md``：
++``H = lse - scale·<q, O^K>`` 在 MHA/GQA、有无因果 mask、TND/varlen、
++序列长到 8192 的范围内误差都在 1e-3（bf16）量级。
++
++为什么不用改 attention 后端
++--------------------------
++在 ``layer.self_attn.attn``（vLLM 的 ``Attention`` 层）上挂一个普通 forward hook 就能
++拿到稠密的 q/k。于是本模块**完全自包含**：不碰 ``attention_v1.py`` 的多分支、
++不碰 ACL graph 捕获路径（它只对候选层额外调一次算子，在图中或图外都能跑）。
++
++层号约定
++--------
++与 ``eagle_aux_hidden_state_layer_ids`` 一致：id ``L`` 取的是**第 L-1 层（0-based）的输出**
++（对应 ``EagleModelMixin._maybe_add_hidden_state`` 里 ``layer_idx = idx + 1``）。
++
++挂在哪个 config 上
++------------------
++draft model 的 ``hf_config`` 上放一个 dict::
++
++    aifd_config = {
++        "candidate_layers": [3, 4, ..., 14],   # eagle_aux 层号约定；空 = 关闭
++        "keep_bos": True,                      # 是否把位置 0 计入 C_l
++    }
++
++本模块只在 Ascend + 该 config 同时存在时才生效，其它情况是纯粹的 no-op。
++"""
++
++from __future__ import annotations
++
++import functools
++from dataclasses import dataclass, field
++from typing import Any
++
++import torch
++import torch.nn as nn
++
++from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++__all__ = [
++    "aifd_config_from",
++    "enable_aifd",
++    "note_layer_and_maybe_emit",
++    "reset_aifd_state",
++]
++
++SWA_INT_MAX = 2147483647
++
++# 与 attention_v1.py 里 get_splitfuse_attn_mask() 的尺寸一致。实测这个固定 2048 的
++# mask 对长于 2048 的序列同样正确（一直测到 8192），不需要 chunked prefill 配合。
++MASK_DIM = 2048
++
++
++# --------------------------------------------------------------------------
++# 状态
++# --------------------------------------------------------------------------
++@dataclass
++class _AifdState:
++    """一次 forward 内的暂存。per-forward 一次性使用，用完即弃。"""
++
++    candidates: tuple[int, ...] = ()
++    # aux 层号 -> 该层 attention 模块（用于取 scale / layer_name）
++    attn_modules: dict[int, nn.Module] = field(default_factory=dict)
++    # aux 层号 -> (T,) 的 head 平均熵，device 上
++    entropy: dict[int, torch.Tensor] = field(default_factory=dict)
++    # aux 层号 -> (T, H) 的层输出
++    hidden: dict[int, torch.Tensor] = field(default_factory=dict)
++    # 每个 request 的 query 长度（用于 per-sample 聚合），来自 attn_metadata
++    seq_lengths: list[int] | None = None
++    enabled: bool = False
++    keep_bos: bool = True
++    # "sample" | "token"，见 _select_layers 的 docstring
++    granularity: str = "sample"
++    emitted: bool = False
++    # 目标模型的层数，enable_aifd 时记下。用来判断"是不是最后一次调用"。
++    num_layers: int = 0
++
++    def reset(self) -> None:
++        self.entropy.clear()
++        self.hidden.clear()
++        self.seq_lengths = None
++        self.emitted = False
++
++
++_STATE = _AifdState()
++
++
++def reset_aifd_state() -> None:
++    """显式清空。hook 正常会在选择完成后自己 reset，这里给异常路径留个口子。"""
++    _STATE.reset()
++
++
++def aifd_extra_channels(hf_config: Any) -> int:
++    """AIFD 会多出几个 hidden-states 通道（关闭时是 0）。
++
++    凡是按通道数分配缓冲的地方都要走这个函数，别各自算 —— 现在有三处：
++    ``ExtractHiddenStatesModel.__init__``、``ExtractHiddenStatesProposer.__init__``，
++    以及 ``CacheOnlyAttentionLayer`` 的 num_heads。
++    """
++    return 1 if aifd_config_from(hf_config) is not None else 0
++
++
++def aifd_config_from(hf_config: Any) -> dict | None:
++    """从 hf_config 读 aifd 配置；没配或候选层为空则返回 None。"""
++    cfg = getattr(hf_config, "aifd_config", None)
++    if not isinstance(cfg, dict):
++        return None
++    candidates = cfg.get("candidate_layers") or []
++    if not candidates:
++        return None
++    return cfg
++
++
++# --------------------------------------------------------------------------
++# 挂 hook
++# --------------------------------------------------------------------------
++def _find_layers(model: nn.Module) -> nn.ModuleList | None:
++    """Qwen2/Qwen3/Llama 系在 ``model.model.layers``；有些模型在 ``model.layers``。"""
++    for path in ("model.layers", "layers", "language_model.model.layers",
++                 "language_model.layers"):
++        obj: Any = model
++        try:
++            for part in path.split("."):
++                obj = getattr(obj, part)
++        except AttributeError:
++            continue
++        if isinstance(obj, nn.ModuleList) and len(obj) > 0:
++            return obj
++    return None
++
++
++def enable_aifd(
++    model: nn.Module, candidates: list[int], granularity: str = "sample"
++) -> bool:
++    """给候选层挂 attention hook。返回是否真的挂上了。
++
++    必须在模型 forward 之前调用（``set_eagle3_aux_hidden_state_layers`` 那个时机）。
++
++    ``granularity``: ``"sample"`` = 同一 request 内所有 token 用同一个层；
++    ``"token"`` = 每个 token 各自选层（DREAM-S 原版）。
++    """
++    if not candidates:
++        return False
++    if granularity not in ("sample", "token"):
++        logger.warning("AIFD: granularity=%s 不认，回退到 sample", granularity)
++        granularity = "sample"
++
++    layers = _find_layers(model)
++    if layers is None:
++        logger.warning("AIFD: 找不到 decoder layers，已禁用")
++        return False
++
++    # 把回调挂到 interfaces 的注入点上（而不是让热路径每次去 import 本模块）
++    from vllm.model_executor.models.interfaces import set_aifd_hook  # noqa: PLC0415
++
++    set_aifd_hook(note_layer_and_maybe_emit)
++
++    num_layers = len(layers)
++    _STATE.candidates = tuple(sorted(candidates))
++    _STATE.num_layers = num_layers
++    _STATE.granularity = granularity
++    _STATE.enabled = True
++    names: list[str] = []
++    for aux_id in _STATE.candidates:
++        model_idx = aux_id - 1  # aux 层号 L 取的是第 L-1 层的输出
++        if not 0 <= model_idx < num_layers:
++            logger.warning("AIFD: 候选层 %d 越界（共 %d 层），已禁用", aux_id, num_layers)
++            _STATE.enabled = False
++            return False
++        attn = layers[model_idx].self_attn.attn
++        attn.register_forward_hook(functools.partial(_attn_hook, aux_id))
++        _STATE.attn_modules[aux_id] = attn
++        names.append(str(aux_id))
++    logger.info(
++        "AIFD: 已挂 %d 个候选层的 attention hook（eagle_aux 层号 %s），粒度=%s",
++        len(names), ",".join(names), granularity,
++    )
++    return True
++
++
++# --------------------------------------------------------------------------
++# attention hook：算每层每 token 的熵
++# --------------------------------------------------------------------------
++_DBG: dict[str, int] = {
++    "t1": 0, "skip_args": 0, "skip_none": 0, "skip_t1": 0,
++    "skip_ctx": 0, "skip_meta": 0, "skip_decode": 0, "ok": 0,
++    "dist_logged": 0,
++}
++
++
++def _attn_hook(aux_id: int, module: nn.Module, args: tuple, output: Any) -> None:
++    if not _STATE.enabled:
++        return
++    # Attention.forward(query, key, value, ...) 收的是 2D [T, heads*head_dim]
++    if len(args) < 2:
++        _DBG["skip_args"] += 1
++        logger.warning_once("AIFD: L%d hook args 不足 %d", aux_id, len(args))
++        return
++    query, key = args[0], args[1]
++    if query is None or key is None:
++        _DBG["skip_none"] += 1
++        logger.warning_once("AIFD: L%d q/k 为 None", aux_id)
++        return
++    num_tokens = query.shape[0]
++    if num_tokens <= 1:  # decode 步不做选层
++        _DBG["skip_t1"] += 1
++        return
++
++    from vllm.model_executor.layers.attention.attention import (  # noqa: PLC0415
++        get_attention_context,
++    )
++
++    try:
++        attn_metadata, _, _, _ = get_attention_context(module.layer_name)
++    except Exception as exc:  # noqa: BLE001 —— 非 v1 runner / 上下文缺失时跳过
++        _DBG["skip_ctx"] += 1
++        logger.warning_once("AIFD: L%d 取 attn_metadata 失败（%s）", aux_id, exc)
++        return
++    attn_mask = getattr(attn_metadata, "attn_mask", None)
++    seq_lengths = getattr(attn_metadata, "actual_seq_lengths_q", None)
++    if attn_mask is None or not seq_lengths:
++        _DBG["skip_meta"] += 1
++        # profile / dummy run 下 attn_metadata 本来就是 None，属正常，只在 debug 里留痕
++        logger.debug_once(
++            "AIFD: L%d metadata 不全 T=%d mask=%s seq_lengths=%s 类型=%s",
++            aux_id, num_tokens, attn_mask is not None, seq_lengths,
++            type(attn_metadata).__name__,
++        )
++        return
++    if getattr(attn_metadata, "num_decode_tokens", 0) > 0:
++        _DBG["skip_decode"] += 1
++        return  # 只在纯 prefill 上选层
++
++    num_heads = module.num_heads
++    num_kv_heads = module.num_kv_heads
++    head_dim = module.head_size
++    scale = float(getattr(module.impl, "scale", head_dim**-0.5))
++
++    q = query.view(num_tokens, num_heads, head_dim)
++    k = key.view(-1, num_kv_heads, head_dim)
++
++    try:
++        # 一次调用同时拿到 lse 和 O^K：value 换成 key，lse 与 V 无关。
++        out_k, lse = _fia(q, k, k, num_heads, num_kv_heads, head_dim, scale,
++                          attn_mask, seq_lengths)
++        # H[t,h] = lse[t,h] - scale·<q[t,h,:], O^K[t,h,:]>
++        dot = (q.float() * out_k.float()).sum(-1) * scale          # (T, heads)
++        entropy = _as_tn(lse, num_tokens, num_heads).float() - dot
++        assert entropy.shape == (num_tokens, num_heads), entropy.shape
++    except Exception as exc:  # noqa: BLE001
++        logger.warning_once("AIFD: 层 %d 的注意力熵计算失败，本轮跳过（%s）", aux_id, exc)
++        return
++
++    # ⚠️ 这里**不能**放 `float(entropy.min())` 之类的调试打印：日志参数是立即求值的，
++    # 即使 debug 不输出也会触发 device→host 同步（LocalScalarDenseNpu）。
++    # 每层 2 次 × 12 层 = 24 次/步，实测会把 stream 同步搞崩（AICPU 507018）。
++    _DBG["ok"] += 1
++    _STATE.entropy[aux_id] = entropy.mean(dim=1)               # (T,) 对 head 平均
++    if _STATE.seq_lengths is None:
++        # 注意 actual_seq_lengths_q 是**累加值**（[5, 10] 表示两段各 5），
++        # 要转成每段长度再用。
++        _STATE.seq_lengths = _cumulative_to_lengths(seq_lengths)
++        assert sum(_STATE.seq_lengths) == num_tokens, (
++            f"AIFD: 分段长度 {_STATE.seq_lengths} 之和 != T={num_tokens}"
++        )
++    del out_k, lse, dot, entropy
++
++
++def _cumulative_to_lengths(cu) -> list[int]:
++    """[5, 10, 12] -> [5, 5, 2]"""
++    cu = [int(x) for x in cu]
++    return [cu[0], *(cu[i] - cu[i - 1] for i in range(1, len(cu)))]
++
++
++def _as_tn(lse: torch.Tensor, num_tokens: int, num_heads: int) -> torch.Tensor:
++    """把算子返回的 lse 统一成 (T, heads)。
++
++    TND 下它的布局不固定：实测既见过 (T, N, 1) 也见过 (N, T, 1)——似乎取决于 T 与 N
++    谁更大。两个都接住，别假设。
++    """
++    x = lse
++    if x.dim() == 3 and x.shape[-1] == 1:
++        x = x.squeeze(-1)
++    if x.shape == (num_heads, num_tokens):
++        x = x.transpose(0, 1)
++    if x.shape != (num_tokens, num_heads):
++        raise RuntimeError(f"lse 形状 {tuple(lse.shape)} 无法归一成 {(num_tokens, num_heads)}")
++    return x
++
++
++def _fia(q, k, v, num_heads, num_kv_heads, head_dim, scale, attn_mask, seq_lengths):
++    """TND 布局、稀疏因果、开 softmax_lse 的注意力。返回 (out, lse)。
++
++    参数组合照搬 ``vllm_ascend/attention/attention_v1.py`` 的生产路径，
++    已在 ``verify_lse_tnd.py`` 上逐项验证过。
++    """
++    import torch_npu  # noqa: PLC0415
++
++    return torch_npu.npu_fused_infer_attention_score(
++        q, k, v,
++        atten_mask=attn_mask,
++        actual_seq_lengths=list(seq_lengths),
++        actual_seq_lengths_kv=list(seq_lengths),
++        num_heads=num_heads,
++        num_key_value_heads=num_kv_heads,
++        scale=scale,
++        input_layout="TND",
++        sparse_mode=3,
++        pre_tokens=SWA_INT_MAX,
++        next_tokens=SWA_INT_MAX,
++        softmax_lse_flag=True,
++    )
++
++
++# --------------------------------------------------------------------------
++# 选层 + emit
++# --------------------------------------------------------------------------
++def note_layer_and_maybe_emit(
++    aux_list: list[torch.Tensor],
++    layer_idx: int,
++    value: torch.Tensor,
++) -> None:
++    """由 ``EagleModelMixin._maybe_add_hidden_state`` 对**每一层**调用一次。
++
++    两件事：
++
++    1. ``layer_idx`` 是候选层 → 把它的输出暂存起来备用（不 append）。
++    2. 所有候选层都过完之后的那一次调用 → 算出每样本的 best 层，把选中的 hidden
++       append 进 ``aux_list``。所以最终只多出**一个**通道。
++
++    刻意不干预调用方原本的 aux 收集逻辑：候选层与 ``aux_hidden_state_layers``
++    可能重叠（例如候选 [3..14] 与 aux [2,18,33] 在 3 上重叠），重叠时两边都要留。
++    """
++    if not _STATE.enabled or not _STATE.candidates:
++        return
++
++    if layer_idx in _STATE.candidates:
++        _STATE.hidden[layer_idx] = value
++        return
++
++    # ⚠️ 必须等到**所有层都过完**（layer_idx == num_layers）再 append。
++    # 曾经用 "layer_idx > max(candidates) 就 append"，结果是：候选层是 [3..14] 时
++    # 它在 layer_idx=15 就插入，而 aux 层 18/33/36 排在它后面 —— 通道顺序变成
++    # [aux2, AIFD, aux18, aux33, aux36]，训练侧按「末尾是 AIFD」切分就会错位。
++    # 这个是靠真实数据（比对 HF 逐层 hidden_states）才发现的。
++    if _STATE.emitted or _STATE.num_layers <= 0 or layer_idx < _STATE.num_layers:
++        return
++
++    _STATE.emitted = True
++
++    # T == 1 是 **已知的 decode 步**（客户端 `max_tokens=1`，服务端还会跑
++    # spec-decode 验证/前缀命中的补齐步）。单 token 算"每样本熵"没有意义，
++    # 所以 attention hook 直接跳过了 —— 这里当然拿不到熵，**不是异常**。
++    # 这些步的 hidden states 不会进训练数据（客户端只取 prefill 的结果，
++    # 而且会用 `check_hidden_states` 校验 token 数），所以兜底通道是安全的。
++    if value.shape[0] == 1:
++        # 前几次用 INFO 露出来，方便看清这种步到底有多常见（不是异常，不需要 warning）
++        _DBG["t1"] += 1
++        if _DBG["t1"] <= 5:
++            logger.info(
++                "AIFD: T=1 步（第 %d 次），用兜底通道；seglens=%s",
++                _DBG["t1"], _STATE.seq_lengths,
++            )
++        _append_fallback(aux_list, value)
++        reset_aifd_state()
++        return
++
++    if not _STATE.entropy or len(_STATE.hidden) != len(_STATE.candidates):
++        missing_ent = [c for c in _STATE.candidates if c not in _STATE.entropy]
++        missing_hid = [c for c in _STATE.candidates if c not in _STATE.hidden]
++        # warmup / dummy run 里 `attn_metadata` 本来就是 None（T = max_model_len，
++        # seglens 也是 None），所有 attention hook 都会在 metadata 那一关退回。
++        # 这是**预期**的，产物也不会被用 —— 归到 debug，别当异常报。
++        if _DBG["skip_meta"] >= len(_STATE.candidates) and _STATE.seq_lengths is None:
++            logger.debug(
++                "AIFD: warmup/dummy run（T=%s，无 attn_metadata），用兜底通道",
++                tuple(value.shape[:2]),
++            )
++            _append_fallback(aux_list, value)
++            reset_aifd_state()
++            return
++        logger.warning(
++            "AIFD: 不完整（prefill 步不该发生）—— 缺熵的层=%s 缺 hidden 的层=%s "
++            "T=%s seglens=%s\n"
++            "  hook 跳过原因计数: args=%d q/kNone=%d T<=1=%d 取ctx失败=%d "
++            "metadata不全=%d 含decode=%d ; 成功=%d",
++            missing_ent or "无", missing_hid or "无",
++            tuple(value.shape[:2]), _STATE.seq_lengths,
++            _DBG["skip_args"], _DBG["skip_none"], _DBG["skip_t1"],
++            _DBG["skip_ctx"], _DBG["skip_meta"], _DBG["skip_decode"], _DBG["ok"],
++        )
++        _append_fallback(aux_list, value)
++        reset_aifd_state()
++        return
++
++    chosen = _select_layers(keep_bos=_STATE.keep_bos)
++    if chosen is None:
++        logger.warning(
++            "AIFD: 选层失败（prefill 步不该发生）T=%s seglens=%s → 用兜底通道",
++            tuple(value.shape[:2]), _STATE.seq_lengths,
++        )
++        _append_fallback(aux_list, value)
++        reset_aifd_state()
++        return
++
++    # 逐 token 按各自 request 选中的层 gather
++    aux_list.append(_gather_per_request(chosen))
++    # 统计分布只在**真要打日志时**才算。`counts[l] > 0` 的真值判断会对 NPU 张量
++    # 做逐元素 device→host 同步，放在热路径上每一步同步 12 次 —— 别那么干。
++    if _DBG["dist_logged"] < 3:
++        _DBG["dist_logged"] += 1
++        counts = torch.bincount(
++            chosen.detach().cpu(), minlength=max(_STATE.candidates) + 1
++        ).tolist()  # 一次性搬回 CPU
++        dist = ", ".join(
++            f"L{l}={counts[l]}" for l in _STATE.candidates if counts[l] > 0
++        )
++        logger.info("AIFD: 选中层分布（按 token） %s", dist)
++    reset_aifd_state()
++
++
++def _append_fallback(aux_list: list[torch.Tensor], value: torch.Tensor) -> None:
++    """拿不到选层结果时的兜底：仍然 append 一个形状正确的 `[T, H]` 张量。
++
++    **这是硬性契约**：`ExtractHiddenStatesModel` 的隐状态缓冲区是按通道数
++    **固定分配**的（`torch.zeros((max_num_tokens, num_hidden_states, hidden_size))`），
++    proposer 那边是 `self.hidden_states[:num_tokens] = stacked_hidden_states`。
++    append 少一个通道不会报"少了一个"，而是直接让 engine 崩在尺寸不匹配上
++    —— 2026-09-21 那次跑了 2 小时后挂掉就是这么来的
++    （27119 次正常选层，1 次不完整就够崩了）。
++
++    兜底用的是某一层的**真实**隐状态（不是零），形状一定对，但语义上不是熵选层。
++    它会打 WARNING，正常情况不该出现。
++    """
++    if _STATE.hidden:
++        aux_list.append(_STATE.hidden[max(_STATE.hidden)])
++    else:
++        aux_list.append(value)
++
++
++def _select_layers(keep_bos: bool) -> torch.Tensor | None:
++    """返回 (T,) 的 long 张量：每个 token 要监督的候选层号。
++
++    粒度由 `aifd_config["granularity"]` 决定（见 `_STATE.granularity`）：
++
++    * ``"sample"``（默认）：同一 request 内所有 token 用**同一个**层。
++      先把 (L, T) 的逐 token 打分按 request 分段、段内对 token 求平均得到 (L,)，
++      再在层维 argmin。这是 DREAM-S 之外我们自己选的粒度。
++    * ``"token"``：每个 token 各自在层维 argmin，逐位置可以不同层。
++      **DREAM-S 原版就是这个粒度。**
++
++    两种粒度返回的都是 `(T,)`，所以调用方 `note_layer_and_maybe_emit`、
++    下游 `_gather_per_request`、通道数、训练侧**全都不用区分** ——
++    差异只在这一个函数里。
++    """
++    seqlens = _STATE.seq_lengths
++    if not seqlens:
++        return None
++    total = sum(seqlens)
++    cands = _STATE.candidates
++
++    # 逐 token 的熵拼成 (L, T)。注意这**本来**就是逐 token 的，
++    # 差别只在下面聚合不聚合。
++    ent = torch.stack([_STATE.entropy[l] for l in cands], dim=0)      # (L, T)
++    if ent.shape[1] != total:
++        return None
++    scores = _score_matrix(ent)                                       # (L, T)
++
++    # 用张量索引而不是 `int(argmin(...).item())` —— `.item()` 每步同步一次设备。
++    cand_ids = torch.tensor(cands, device=ent.device)
++
++    # ── per-token：沿层维 argmin，每个 token 一个层号，一行搞定 ──
++    if _STATE.granularity == "token":
++        return cand_ids[torch.argmin(scores, dim=0)]
++
++    # ── per-sample：按 request 分段，段内先对 token 求平均再 argmin ──
++    per_token_layer = torch.empty(total, dtype=torch.long, device=ent.device)
++    offset = 0
++    for n in seqlens:
++        sl = slice(offset, offset + n)
++        seg = scores[:, sl]
++        if not keep_bos and n > 1:
++            seg = seg[:, 1:]
++        per_token_layer[sl] = cand_ids[torch.argmin(seg.mean(dim=1))]
++        offset += n
++    return per_token_layer
++
++
++def _score_matrix(ent: torch.Tensor) -> torch.Tensor:
++    """score_l = C_l + |C_l - C_{l-1}|（逐 token 版；l=0 行填 +inf 排除）。"""
++    L = ent.shape[0]
++    out = torch.full_like(ent, float("inf"))
++    if L > 1:
++        out[1:] = ent[1:] + (ent[1:] - ent[:-1]).abs()
++    return out
++
++
++def _gather_per_request(per_token_layer: torch.Tensor) -> torch.Tensor:
++    """按每个 token 各自选中的层号，把 hidden 取出来。返回 (T, H)。
++
++    ⚠️ 全程**不能**有 device→host 同步。曾经的写法是
++    `if not bool(mask.any()): continue` —— `bool()` 一个 NPU 张量就是一次同步，
++    12 个候选层 = 每步 12 次，和日志那两处加起来足以把 stream 同步搞崩。
++    现在改成纯 `torch.where`：先拿第一个候选层打底，再逐个覆盖。
++    每个 token 选中的层**必然**是候选层之一（`_select_per_request` 保证），
++    所以打底那个不会被漏掉。
++    """
++    cands = _STATE.candidates
++    out = _STATE.hidden[cands[0]]
++    for aux_id in cands[1:]:
++        out = torch.where((per_token_layer == aux_id).unsqueeze(-1), _STATE.hidden[aux_id], out)
++    assert out.shape[0] == per_token_layer.shape[0]
++    return out
+diff --git a/vllm/model_executor/models/extract_hidden_states.py b/vllm/model_executor/models/extract_hidden_states.py
+index 87dba7b5c9..98024f0d17 100644
+--- a/vllm/model_executor/models/extract_hidden_states.py
++++ b/vllm/model_executor/models/extract_hidden_states.py
+@@ -18,6 +18,7 @@ import torch.nn as nn
+ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+ from vllm.config.cache import CacheDType
+ from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention.attention import set_default_quant_scales
+ from vllm.model_executor.layers.attention.kv_transfer_utils import (
+     maybe_transfer_kv_layer,
+@@ -38,6 +39,8 @@ from vllm.v1.kv_cache_interface import (
+     KVCacheSpec,
+ )
+ 
++logger = init_logger(__name__)
++
+ ########## Custom Ops ########
+ 
+ 
+@@ -346,10 +349,23 @@ class ExtractHiddenStatesModel(nn.Module):
+         self.target_num_hidden_layers = (
+             vllm_config.model_config.get_total_num_hidden_layers()
+         )
+-        self.num_hidden_states = len(
+-            getattr(self.hf_config, "eagle_aux_hidden_state_layer_ids", [])
++        num_aux = len(getattr(self.hf_config, "eagle_aux_hidden_state_layer_ids", []))
++        # AIFD 会额外追加一个「按注意力熵选层」的通道（见 models/aifd.py）。
++        # 候选层为空或没配时是 no-op。
++        from vllm.model_executor.models.aifd import (  # noqa: PLC0415
++            aifd_config_from,
++            aifd_extra_channels,
+         )
+ 
++        self.aifd_cfg = aifd_config_from(self.hf_config)
++        self.num_hidden_states = num_aux + aifd_extra_channels(self.hf_config)
++        if self.aifd_cfg:
++            logger.info(
++                "AIFD enabled: %d aux channel(s) + 1 entropy-selected channel = %d",
++                num_aux,
++                self.num_hidden_states,
++            )
++
+         cache_config = vllm_config.cache_config
+ 
+         # Hidden states dtype should be independent of KV cache dtype.
+diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
+index 32534f8fbb..b205e74c36 100644
+--- a/vllm/model_executor/models/interfaces.py
++++ b/vllm/model_executor/models/interfaces.py
+@@ -1340,6 +1340,18 @@ class LocalArgmaxMixin:
+         return top
+ 
+ 
++# AIFD（可选，默认关闭）的注入点。`aifd.enable_aifd()` 在模型装载时把它设上，
++# 没开 AIFD 的进程永远保持 None —— 热路径上零成本、零 import。
++# 这是共享的 vLLM 源码树，别的任务也会跑这段代码，所以刻意做成这样。
++_aifd_hook: "Callable[[list, int, torch.Tensor], None] | None" = None
++
++
++def set_aifd_hook(fn) -> None:
++    """由 `vllm.model_executor.models.aifd.enable_aifd` 调用。"""
++    global _aifd_hook  # noqa: PLW0603
++    _aifd_hook = fn
++
++
+ class EagleModelMixin:
+     aux_hidden_state_layers: tuple[int, ...] = ()
+ 
+@@ -1353,9 +1365,14 @@ class EagleModelMixin:
+         hidden_states: torch.Tensor,
+         residual: torch.Tensor,
+     ) -> list[torch.Tensor]:
++        value = hidden_states + residual if residual is not None else hidden_states
+         if layer_idx in self.aux_hidden_state_layers:
+-            value = hidden_states + residual if residual is not None else hidden_states
+             aux_hidden_states.append(value)
++        # AIFD（可选，默认关闭）：候选层暂存、全部过完之后追加一个"熵选层"通道。
++        # 与上面那段互不干扰 —— 层号重叠时两条路都会保留。
++        # 关着的时候 `_aifd_hook` 是 None，热路径上只有这一次判断，没有 import。
++        if _aifd_hook is not None:
++            _aifd_hook(aux_hidden_states, layer_idx, value)
+         return aux_hidden_states
+ 
+ 
+diff --git a/vllm/v1/spec_decode/extract_hidden_states.py b/vllm/v1/spec_decode/extract_hidden_states.py
+index de7a075e2f..8ed7a3257b 100644
+--- a/vllm/v1/spec_decode/extract_hidden_states.py
++++ b/vllm/v1/spec_decode/extract_hidden_states.py
+@@ -73,7 +73,11 @@ class ExtractHiddenStatesProposer:
+                 "eagle_aux_hidden_state_layer_ids must be set in the draft "
+                 "model config for extract_hidden_states method"
+             )
+-        self.num_hidden_states = len(layer_ids)
++        # AIFD 会额外追加一个「按注意力熵选层」的通道（见 models/aifd.py）。
++        # 这里必须和 ExtractHiddenStatesModel.__init__ 里的算法保持一致。
++        from vllm.model_executor.models.aifd import aifd_extra_channels  # noqa: PLC0415
++
++        self.num_hidden_states = len(layer_ids) + aifd_extra_channels(self.hf_config)
+         self.hidden_size = vllm_config.model_config.get_hidden_size()
+         self.hidden_states = torch.zeros(
+             (self.max_num_tokens, self.num_hidden_states, self.hidden_size),
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+index 66d0ba8b43..99309cb077 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+@@ -30,6 +30,30 @@ def set_eagle3_aux_hidden_state_layers(
+         aux_layers = eagle3_model.get_eagle3_default_aux_hidden_state_layers()
+         logger.info("Using Eagle3 auxiliary layers from model: %s", aux_layers)
+     eagle3_model.set_aux_hidden_state_layers(aux_layers)
++    maybe_enable_aifd(model, spec_config)
++
++
++def maybe_enable_aifd(model: nn.Module, spec_config: SpeculativeConfig) -> bool:
++    """AIFD（可选）：额外产出一个「按注意力熵选层」的 hidden-states 通道。
++
++    没配 ``aifd_config`` 时是纯粹的 no-op。两条 model runner 路径都要调这个
++    （v2 走 ``set_eagle3_aux_hidden_state_layers``；v1 在
++    ``gpu_model_runner._set_eagle3_aux_hidden_state_layers`` 里有自己的一套内联逻辑，
++    不会经过这里）。
++    """
++    from vllm.model_executor.models.aifd import (  # noqa: PLC0415
++        aifd_config_from,
++        enable_aifd,
++    )
++
++    aifd_cfg = aifd_config_from(spec_config.draft_model_config.hf_config)
++    if not aifd_cfg:
++        return False
++    return enable_aifd(
++        model,
++        list(aifd_cfg["candidate_layers"]),
++        str(aifd_cfg.get("granularity", "sample")).lower(),
++    )
+ 
+ 
+ def get_eagle3_aux_layers_from_config(
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index efb302b90f..291987b5fe 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -5410,6 +5410,15 @@ class GPUModelRunner(
+ 
+         self.model.set_aux_hidden_state_layers(aux_layers)
+ 
++        # AIFD（可选）：额外产出一个「按注意力熵选层」的 hidden-states 通道。
++        # 没配 aifd_config 时是纯粹的 no-op。
++        from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (  # noqa: PLC0415
++            maybe_enable_aifd,
++        )
++
++        if self.speculative_config is not None:
++            maybe_enable_aifd(self.model, self.speculative_config)
++
+     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
+         """Extract Eagle3 auxiliary layer indices from speculative config.
+ 
